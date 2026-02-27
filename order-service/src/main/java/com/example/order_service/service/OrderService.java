@@ -1,57 +1,64 @@
 package com.example.order_service.service;
 
-import com.example.order_service.client.InventoryClient;
-import com.example.order_service.dto.InventoryResponse;
 import com.example.order_service.dto.OrderRequest;
+import com.example.order_service.event.OrderCreatedEvent;
 import com.example.order_service.model.Order;
+import com.example.order_service.producer.OrderProducer;
 import com.example.order_service.repository.OrderRepository;
-import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
-import java.util.List;
 import java.util.UUID;
 
+/*
+Al usar RabbitMQ si el inventario se cae, el pedido se guarda en PostgreSQL,
+el cliente recibe una confirmación inmediata, y el mensaje se queda
+seguro en la cola esperando a que el inventario reviva para procesarlo.
+Mejoré la tolerancia a fallos y reduje la latencia de la API.
+*/
+
 @Service
-@RequiredArgsConstructor
-@Transactional
 public class OrderService {
 
     private final OrderRepository orderRepository;
-    private final InventoryClient inventoryClient;
+    private final OrderProducer orderProducer;
 
+
+    public OrderService(OrderRepository orderRepository, OrderProducer orderProducer) {
+        this.orderRepository = orderRepository;
+        this.orderProducer = orderProducer;
+    }
+
+    @Transactional
+    //realizar pedido
     public String placeOrder(OrderRequest orderRequest) {
-        // 1. Validamos stock (Cambiamos el nombre a InventoryResponse para no confundir)
-        List<InventoryResponse> inventoryResponses = inventoryClient.isInStock(List.of(orderRequest.getSkuCode()));
 
-        boolean allProductsInStock = inventoryResponses.stream()
-                .allMatch(InventoryResponse::isInStock);
+        BigDecimal unitPrice = new BigDecimal("100.00"); // Precio de ejemplo
+        BigDecimal totalPrice = unitPrice.multiply(BigDecimal.valueOf(orderRequest.getQuantity()));
 
-        if (allProductsInStock && !inventoryResponses.isEmpty()) {
+        // se crea la orden en estado PENDING (Pendiente)
+        Order order = Order.builder()
+                .orderNumber(UUID.randomUUID().toString())
+                .skuCode(orderRequest.getSkuCode())
+                .quantity(orderRequest.getQuantity())
+                .price(unitPrice)
+                .totalAmount(totalPrice)
+                .status("PENDING") // estará pendiente hasta que el inventario lo confirme después
+                .build();
 
-            // --- LÓGICA DE CÁLCULO (VALOR AGREGADO) ---
-            // Simulamos que el precio viene de un catálogo o del mismo request
-            BigDecimal unitPrice = new BigDecimal("100.00"); // En el futuro vendrá de un ProductClient
-            BigDecimal totalAmount = unitPrice.multiply(BigDecimal.valueOf(orderRequest.getQuantity()));
+        orderRepository.save(order);
 
-            Order order = Order.builder()
-                    .orderNumber(UUID.randomUUID().toString())
-                    .skuCode(orderRequest.getSkuCode())
-                    .quantity(orderRequest.getQuantity())
-                    .price(unitPrice)        // Guardamos el precio del momento
-                    .totalAmount(totalAmount) // Guardamos el total calculado
-                    .status("PENDING")       // Usamos PENDING porque RabbitMQ procesará el resto
-                    .build();
+        // creo el evento con los datos que le importan al inventario
+        OrderCreatedEvent event = new OrderCreatedEvent();
+        event.setOrderNumber(order.getOrderNumber());
+        event.setSkuCode(order.getSkuCode());
+        event.setQuantity(order.getQuantity());
 
-            orderRepository.save(order);
+        // disparo el mensaje a RabbitMQ de forma asíncrona
+        orderProducer.enviarPedidoARabbitMQ(event);
 
-            // --- AQUÍ ENTRARÁ RABBITMQ ---
-            // Próximo paso: enviar 'order' a la cola.
-
-            return "Order received with number: " + order.getOrderNumber();
-        } else {
-            throw new IllegalArgumentException("Product is not in stock");
-        }
+        return "Pedido recibido con éxito (Nro: " + order.getOrderNumber() + "). Procesando inventario.";
     }
 }
+
